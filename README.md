@@ -1,5 +1,6 @@
 # Recast Customizer — Falcon Glove
-<img width="1350" height="762" alt="project_cover_image3" src="https://github.com/user-attachments/assets/0f1b9f33-4d56-4cc0-9b94-d1326545240a" />
+<img width="1500" height="843" alt="project_cover_image" src="https://github.com/user-attachments/assets/f9ec928f-7139-4e2d-9cbc-772b65dfd89d" />
+
 
 A material review tool for modular game assets. It puts an asset in a browser under the
 lighting it was authored against, lets anyone swap parts and move five material values,
