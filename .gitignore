@@ -1,0 +1,11 @@
+# This repository is source for reading, not a buildable Unity project.
+# Unity's generated folders should never appear here.
+Library/
+Temp/
+Logs/
+Obj/
+Build/
+UserSettings/
+*.csproj
+*.sln
+*.meta
