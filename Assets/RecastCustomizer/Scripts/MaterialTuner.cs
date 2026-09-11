@@ -313,35 +313,22 @@ namespace RecastCustomizer
             return b;
         }
 
-        // ---------------------------------------------------------------- export
-
-        [Serializable]
-        private class LookEntry
-        {
-            public string segment;
-            public string variant;
-            public float hue, saturation, brightness, smoothness, normal;
-        }
-
-        [Serializable]
-        private class LookFile
-        {
-            public string asset;
-            public string combination;
-            public string savedUtc;
-            public List<LookEntry> looks = new();
-        }
+        // ---------------------------------------------------------------- designs
 
         /// <summary>
-        /// The reviewer's decisions as a small text file. Only edited variants are written,
-        /// so an untouched review exports an empty list rather than a wall of defaults that
-        /// would overwrite the artist's own values on the way back in.
+        /// Everything the tool currently shows, as one design.
+        ///
+        /// Every part is written, not only the adjusted ones, because a design is a finished
+        /// thing rather than a list of changes. The tuned flag on each part is what lets the
+        /// importer reuse the artist's material where nothing was altered and write a new
+        /// asset only where something was.
         /// </summary>
-        public string ToJson()
+        public SavedDesign CaptureDesign(string name)
         {
             var set = _assembly.VariantSet;
-            var file = new LookFile
+            var design = new SavedDesign
             {
+                name = string.IsNullOrWhiteSpace(name) ? "" : name.Trim(),
                 asset = set.assetName,
                 combination = _assembly.GetCombinationCode(),
                 savedUtc = DateTime.UtcNow.ToString("u")
@@ -349,13 +336,16 @@ namespace RecastCustomizer
 
             for (int s = 0; s < set.segments.Count; s++)
             {
-                if (!IsTouched(s)) continue;
-                var look = LookFor(s);
                 var seg = set.segments[s];
-                file.looks.Add(new LookEntry
+                var look = LookFor(s);
+                int index = _assembly.Selection[s];
+
+                design.parts.Add(new SavedDesignPart
                 {
                     segment = seg.id,
-                    variant = seg.VariantId(_assembly.Selection[s]),
+                    variant = seg.VariantId(index),
+                    variantIndex = index,
+                    tuned = IsTouched(s),
                     hue = look.hue,
                     saturation = look.saturation,
                     brightness = look.brightness,
@@ -363,8 +353,86 @@ namespace RecastCustomizer
                     normal = look.normal
                 });
             }
-            return JsonUtility.ToJson(file, true);
+            return design;
         }
+
+        /// <summary>
+        /// Put a saved design back on the glove: the part choices first, then the look values
+        /// on top of them.
+        ///
+        /// Parts are matched by variant id rather than by the stored index, because an index
+        /// stops meaning the same thing the moment a variant is inserted or reordered in the
+        /// set. The index is kept in the file only as a fallback.
+        /// </summary>
+        public void ApplyDesign(SavedDesign design)
+        {
+            if (design == null || _assembly == null) return;
+            var set = _assembly.VariantSet;
+            if (set == null) return;
+
+            for (int s = 0; s < set.segments.Count; s++)
+            {
+                var seg = set.segments[s];
+                var part = design.Part(seg.id);
+                if (part == null) continue;
+
+                int index = -1;
+                for (int v = 0; v < seg.VariantCount; v++)
+                    if (seg.VariantId(v) == part.variant) { index = v; break; }
+                if (index < 0) index = Mathf.Clamp(part.variantIndex, 0, Mathf.Max(0, seg.VariantCount - 1));
+
+                _assembly.SetVariantAt(s, index);
+            }
+
+            // Looks are set after the swaps, because a swap re-resolves the live material and
+            // would otherwise discard the values written a moment earlier.
+            for (int s = 0; s < set.segments.Count; s++)
+            {
+                var part = design.Part(set.segments[s].id);
+                if (part == null) continue;
+
+                var look = LookFor(s);
+                look.hue = part.hue;
+                look.saturation = part.saturation;
+                look.brightness = part.brightness;
+                look.smoothness = part.smoothness;
+                look.normal = part.normal;
+            }
+            ApplyAll();
+        }
+
+        /// <summary>
+        /// How many new textures the current state would cost on import.
+        ///
+        /// Smoothness and normal strength are material values and are free. Hue, saturation
+        /// and brightness have to become pixels, so each part carrying one costs a new map at
+        /// the source resolution. Showing this while somebody is still choosing is the
+        /// difference between a cost they decided to pay and one an engineer finds later.
+        /// </summary>
+        public int PendingBakeCount()
+        {
+            var set = _assembly != null ? _assembly.VariantSet : null;
+            if (set == null) return 0;
+            int n = 0;
+            for (int s = 0; s < set.segments.Count; s++)
+                if (IsTouched(s) && LookFor(s).ColourTouched) n++;
+            return n;
+        }
+
+        // ---------------------------------------------------------------- export
+
+        /// <summary>
+        /// The current design as a file.
+        ///
+        /// One format serves both jobs. The handoff importer reads every part and rebuilds
+        /// the design; the review importer reads the same file and looks only at the parts
+        /// marked tuned. Two formats would have drifted apart within a week.
+        /// </summary>
+        public string ToJson() => JsonUtility.ToJson(CaptureDesign(null), true);
+
+        /// <summary>The named variant of the above, used when a design is saved by hand.</summary>
+        public string ToJson(string designName) =>
+            JsonUtility.ToJson(CaptureDesign(designName), true);
 
         public int TouchedCount()
         {

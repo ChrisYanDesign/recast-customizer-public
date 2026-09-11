@@ -21,22 +21,10 @@ namespace RecastCustomizer.EditorTools
     /// </summary>
     public static class LookFileImporter
     {
-        [Serializable]
-        private class LookEntry
-        {
-            public string segment;
-            public string variant;
-            public float hue, saturation = 1f, brightness = 1f, smoothness = 0.5f, normal = 1f;
-        }
-
-        [Serializable]
-        private class LookFile
-        {
-            public string asset;
-            public string combination;
-            public string savedUtc;
-            public List<LookEntry> looks = new();
-        }
+        // No local file format any more. The tool exports a SavedDesign and both importers
+        // read that same type, so the two cannot drift apart. This one looks only at the
+        // parts marked tuned, because overwriting a material nobody adjusted would rewrite
+        // the artist's own values for no reason.
 
         [MenuItem("Recast Customizer/Apply Look File")]
         public static void Apply()
@@ -67,10 +55,10 @@ namespace RecastCustomizer.EditorTools
                 return;
             }
 
-            LookFile file;
+            SavedDesign file;
             try
             {
-                file = JsonUtility.FromJson<LookFile>(File.ReadAllText(path));
+                file = JsonUtility.FromJson<SavedDesign>(File.ReadAllText(path));
             }
             catch (Exception e)
             {
@@ -78,10 +66,22 @@ namespace RecastCustomizer.EditorTools
                 return;
             }
 
-            if (file == null || file.looks == null || file.looks.Count == 0)
+            if (file == null || file.parts == null || file.parts.Count == 0)
             {
                 Debug.LogWarning("[LookFile] That file contains no adjustments. Nothing to apply.\n" +
                                  "  An export only records variants the reviewer actually changed.");
+                return;
+            }
+
+            // A design file describes every part. This importer handles the review leg, so
+            // it narrows to the parts somebody actually adjusted. To bring a whole design in
+            // as new assets instead, use Recast Customizer > Import Design From File.
+            var looks = file.parts.FindAll(p => p != null && p.tuned);
+            if (looks.Count == 0)
+            {
+                Debug.LogWarning("[LookFile] Nothing in that file was adjusted. It records a "
+                    + "combination of existing materials, so there is nothing to overwrite. "
+                    + "Use 'Import Design From File' to bring it in as a new design.");
                 return;
             }
 
@@ -100,11 +100,11 @@ namespace RecastCustomizer.EditorTools
             // asks first. A look file arrives from outside the project, and rewriting an
             // artist's source materials on the strength of it should never be a surprise.
             var names = new List<string>();
-            foreach (var e in file.looks) names.Add("  " + e.segment + " " + e.variant);
+            foreach (var e in looks) names.Add("  " + e.segment + " " + e.variant);
             string nl = System.Environment.NewLine;
             if (!EditorUtility.DisplayDialog(
                     "Write to material assets?",
-                    "This will change " + file.looks.Count + " material asset(s) on disk:"
+                    "This will change " + looks.Count + " material asset(s) on disk:"
                     + nl + nl + string.Join(nl, names) + nl + nl
                     + "Undo reverses it. Continue?",
                     "Write materials", "Cancel"))
@@ -116,7 +116,7 @@ namespace RecastCustomizer.EditorTools
             var applied = new List<string>();
             var skipped = new List<string>();
 
-            foreach (var entry in file.looks)
+            foreach (var entry in looks)
             {
                 var seg = set.FindSegment(entry.segment);
                 if (seg == null) { skipped.Add(entry.segment + " (no such segment)"); continue; }
@@ -180,7 +180,8 @@ namespace RecastCustomizer.EditorTools
         /// the file is a number a material can hold; a hue rotation is not, so it has to
         /// become pixels.
         /// </summary>
-        private static Texture2D BakeAdjustedMap(Material mat, LookEntry entry)
+        internal static Texture2D BakeAdjustedMap(Material mat, SavedDesignPart entry,
+                                                  string requestedPath = null)
         {
             var source = mat.HasProperty("_BaseMap") ? mat.GetTexture("_BaseMap") : mat.mainTexture;
             if (source == null) return null;
@@ -220,6 +221,12 @@ namespace RecastCustomizer.EditorTools
                 : Path.GetFileNameWithoutExtension(sourcePath) + "_adjusted";
             var outPath = AssetDatabase.GenerateUniqueAssetPath(
                 (dir + "/" + stem + ".png").Replace('\\', '/'));
+
+            // A caller that knows where the map belongs wins over the derived location.
+            // The design importer keeps a design's maps beside that design; the review
+            // importer has no such folder and still wants a sibling of the source.
+            if (!string.IsNullOrEmpty(requestedPath))
+                outPath = AssetDatabase.GenerateUniqueAssetPath(requestedPath);
 
             File.WriteAllBytes(outPath, readback.EncodeToPNG());
             UnityEngine.Object.DestroyImmediate(readback);

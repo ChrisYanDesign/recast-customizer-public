@@ -215,7 +215,9 @@ namespace RecastCustomizer
 
         private readonly List<Callout> _callouts = new();
         private readonly List<StatRow> _stats = new();
-        private readonly List<Button> _presetTiles = new();
+        // Rows, not Buttons. A design row is a container: the name is a button inside it
+        // so the buttons beside it can be clicked without also wearing the design.
+        private readonly List<VisualElement> _presetTiles = new();
         private readonly List<MaterialRow> _matRows = new();
         private readonly List<VisualElement> _bottomAnchored = new();
         private readonly List<KnobRow> _knobs = new();
@@ -230,6 +232,34 @@ namespace RecastCustomizer
         private int _focused;               // which segment the sliders are editing
         private Label _tunerTitle;
         private Label _costRow;
+        private Label _bakeRow;
+        private TextField _designNameField;
+        private VisualElement _savedList;
+        private ScrollView _designList;
+        private readonly List<VisualElement> _savedTiles = new();
+
+        // Which saved design is being worn, or -1 for none.
+        //
+        // The fixed designs can be identified by looking at the glove: they are "the same
+        // variant on every part", so the selection alone says which one is on. A saved design
+        // cannot be recognised that way, because two different designs can share a combination
+        // and differ only in their look values. So it has to be remembered rather than
+        // deduced, or clicking one highlights whichever fixed design happens to match its
+        // parts.
+        private int _wornSaved = -1;
+
+        // The last max-height applied to the list. Compared against before writing, because
+        // writing a style inside a geometry callback would re-trigger the callback.
+        private float _appliedListHeight = -1f;
+
+        // Six rows is what the panel can show without crowding the tuner beneath it. Saving a
+        // seventh does not make the panel taller; it makes the list scroll.
+        private const int MaxVisibleDesigns = 6;
+
+        [Tooltip("How many of the variant set's designs are the artist's own. Those keep their " +
+                 "picture and cannot be exported or dismissed. Everything past this count is " +
+                 "an additional design and gets EXPORT and a delete button instead.")]
+        [SerializeField] private int defaultDesignCount = 3;
 
         private Renderer[] _segmentRenderers;
         private VisualElement _root;
@@ -650,6 +680,20 @@ namespace RecastCustomizer
             _costRow = line[0] as Label;
             c.Add(line);
 
+            // The cost of the decision being made right now, rather than of the asset.
+            //
+            // Two of the five look controls are free: smoothness and normal strength are
+            // numbers a material can hold. The other three cannot be expressed on a stock Lit
+            // shader, so hue, saturation or brightness on a part means that part's base map
+            // has to be re-rendered and saved as a new texture when the design is imported.
+            //
+            // Nobody in a browser can see that coming, and an engineer finds out weeks later
+            // when the build is heavier. Saying it here, while the slider is still under the
+            // cursor, is what turns a figure into a warning.
+            var bake = FigureRow("NONE", "NEW MAPS IF SAVED", Gold);
+            _bakeRow = bake[0] as Label;
+            c.Add(bake);
+
             UpdateCostRow();
         }
 
@@ -699,6 +743,49 @@ namespace RecastCustomizer
             // other. This measures something different -- the texture memory the equipped
             // materials actually occupy -- so it says that instead.
             _costRow.text = Spaced((bytes / 1048576f).ToString("0.0") + " MB");
+            UpdateBakeRow();
+        }
+
+        /// <summary>
+        /// What saving the current look would add on import, counted in real maps and real
+        /// megabytes rather than as a vague caution.
+        ///
+        /// The size is taken from the actual base map of each part that would need baking, so
+        /// a 2048 map reports what a 2048 map costs. A part that was only swapped, or tuned
+        /// only on smoothness or normal strength, contributes nothing and is not counted.
+        /// </summary>
+        private void UpdateBakeRow()
+        {
+            if (_bakeRow == null || _tuner == null || assembly == null) return;
+            var set = assembly.VariantSet;
+            if (set == null) return;
+
+            int maps = 0;
+            long bytes = 0;
+
+            for (int s = 0; s < set.segments.Count && s < assembly.Selection.Count; s++)
+            {
+                if (!_tuner.IsTouched(s)) continue;
+                if (!_tuner.LookFor(s).ColourTouched) continue;
+
+                maps++;
+                var mat = set.segments[s].VariantMaterial(assembly.Selection[s]);
+                var src = mat != null
+                    ? (mat.HasProperty("_BaseMap") ? mat.GetTexture("_BaseMap") : mat.mainTexture)
+                    : null;
+                if (src != null) bytes += (long)src.width * src.height * 4L;
+            }
+
+            if (maps == 0)
+            {
+                _bakeRow.text = Spaced("NONE");
+                _bakeRow.style.color = Parchment;
+                return;
+            }
+
+            _bakeRow.text = Spaced(maps + (maps == 1 ? " MAP  +" : " MAPS  +")
+                                   + (bytes / 1048576f).ToString("0") + " MB");
+            _bakeRow.style.color = Gold;
         }
 
         /// <summary>
@@ -1075,8 +1162,20 @@ namespace RecastCustomizer
         }
 
         /// <summary>
-        /// Bottom-left: the whole-glove design presets. Each row is a name beside its
-        /// picture rather than a caption printed over it, so both stay legible.
+        /// Bottom-left: every whole-glove design, in one list.
+        ///
+        /// The numbered designs come from the variant set and are fixed. Clicking one returns
+        /// the glove to how that design was authored, look adjustments cleared, so a default
+        /// stays a reference point instead of drifting with whatever was tried last.
+        ///
+        /// Designs saved in this session sit below them and share the row shape, because to
+        /// the person choosing they are the same kind of thing. Where a fixed design carries
+        /// its picture, a saved one carries an EXPORT button: a template has nowhere to go,
+        /// and a design somebody just made does.
+        ///
+        /// The list scrolls rather than growing. A panel that gets taller with every save
+        /// eventually pushes its own contents off the bottom of the screen, which has already
+        /// happened once in this project.
         /// </summary>
         private void BuildDesignCorner(GloveVariantSet set)
         {
@@ -1092,62 +1191,522 @@ namespace RecastCustomizer
             c.style.minWidth = U(identityWidth);
             c.Add(Centred(SectionLabel("PRESETS")));
 
+            _designList = new ScrollView(ScrollViewMode.Vertical);
+            _designList.style.flexShrink = 0;
+            _designList.horizontalScrollerVisibility = ScrollerVisibility.Hidden;
+
+            // Hidden until proven otherwise. A scrollbar on a list that fits is worse than no
+            // scrollbar at all: it says there is more to see when there is not.
+            _designList.verticalScrollerVisibility = ScrollerVisibility.Hidden;
+            _designList.style.maxHeight = RowHeight() * MaxVisibleDesigns;
+
+            // The real height of a row is settled by layout, not by arithmetic. Predicting it
+            // from the padding and the thumbnail size was 15 pixels short per row, so the list
+            // was sized for four and a half rows and the scrollbar arrived at five designs
+            // instead of seven. Measuring once the rows exist cannot be wrong in that way.
+            _designList.RegisterCallback<GeometryChangedEvent>(evt => UpdateListHeight());
+
+            StyleScroller(_designList);
+            c.Add(_designList);
+
             for (int i = 0; i < presetCount; i++)
             {
                 int preset = i;
-                var tile = new Button(() => ApplyPreset(preset));
-                tile.text = string.Empty;
-                ResetThemeDefaults(tile);
-                tile.style.flexDirection = FlexDirection.Row;
-                tile.style.alignItems = Align.Center;
-                tile.style.width = Length.Percent(100f);
-                tile.style.marginBottom = U(7f);
-                tile.style.paddingLeft = U(8f);
-                tile.style.paddingRight = U(6f);
-                tile.style.paddingTop = U(5f);
-                tile.style.paddingBottom = U(5f);
-                tile.style.backgroundColor = new Color(1f, 0.94f, 0.78f, 0.05f);
-                SetBorderWidth(tile, 1);
+                string variantId = VariantIdOf(set, preset);
 
-                var cap = new Label("DESIGN " + (i + 1));
-                cap.style.fontSize = S(BaseSection) * 1.12f;
-                cap.style.letterSpacing = U(1.3f);
-                cap.style.wordSpacing = U(4f);
-                cap.style.color = Parchment;
-                cap.style.unityFontStyleAndWeight = FontStyle.Bold;
-                cap.style.flexGrow = 1f;
-                cap.style.unityTextAlign = TextAnchor.MiddleLeft;
-                ApplyFont(cap, true);
-                tile.Add(cap);
+                // A design dismissed with its X stays out of the list until the library is
+                // cleared. The row is skipped rather than removed from the set, because the
+                // set is a project asset and the running tool has no business editing one.
+                if (HiddenDesigns.IsHidden(variantId)) continue;
 
-                // A whole-outfit image if one has been supplied, otherwise fall back to the
-                // hero part's preview. The fallback only ever showed one piece of the glove,
-                // which is a poor stand-in for a complete design.
-                var thumb = set.DesignThumbnail(preset)
-                            ?? (preset < hero.VariantCount ? PreviewFor(hero, preset) : null);
+                bool isDefault = i < defaultDesignCount;
 
-                // One shape for all three, not one per image. Sizing each box to its own
-                // picture made the three rows different heights, which reads as a mistake.
-                // Now that previews fill and crop, the box can hold its shape and let each
-                // image adapt to it instead.
-                var art = new VisualElement();
-                float artW = U(presetWidth * 1.85f);
-                art.style.width = artW;
-                art.style.height = artW / 1.75f;
-                art.style.flexShrink = 0;
-                if (thumb != null)
+                VisualElement right;
+                if (isDefault)
                 {
-                    art.style.backgroundImage = new StyleBackground(thumb);
-                    Fit(art);
+                    var thumb = set.DesignThumbnail(preset)
+                                ?? (preset < hero.VariantCount ? PreviewFor(hero, preset) : null);
+                    right = ThumbBox(thumb);
                 }
-                else art.style.backgroundColor = ChipBg;
-                SetBorderWidth(art, 1);
-                SetBorderColor(art, new Color(ChipBorder.r, ChipBorder.g, ChipBorder.b, 0.5f));
-                tile.Add(art);
+                else
+                {
+                    // No picture. There is no authored image for a design nobody authored, and
+                    // an empty frame reads as a missing file rather than as a deliberate blank.
+                    right = RowControls(() => ExportCurrentAs(preset),
+                                        () => DismissPreset(variantId));
+                }
 
-                c.Add(tile);
-                _presetTiles.Add(tile);
+                var row = DesignRow("DESIGN " + (i + 1), () => ApplyPreset(preset),
+                                    right, isDefault);
+                _designList.Add(row);
+                _presetTiles.Add(row);
             }
+
+            // Saved designs live in their own container inside the same scroll, so a save can
+            // redraw them without touching the fixed designs above.
+            _savedList = new VisualElement();
+            _savedList.style.width = Length.Percent(100f);
+            _designList.Add(_savedList);
+            RebuildSavedList();
+
+            BuildSaveRow(c, presetCount);
+            UpdateListHeight();
+        }
+
+        /// <summary>Height of one design row, so six of them can be measured off.</summary>
+        private float RowHeight() => U(presetWidth * 1.85f) / 1.75f + U(10f) + U(7f);
+
+        /// <summary>
+        /// One row: a name that wears the design, and one thing on its right.
+        ///
+        /// Whether that right-hand thing is part of the button depends on what it is. A
+        /// thumbnail is not a control, it is a picture of the design, so it belongs inside the
+        /// button and the whole rectangle switches the glove -- aiming at the picture and
+        /// having nothing happen is exactly the kind of small wrongness that makes an
+        /// interface feel broken. Export and delete are controls in their own right, so they
+        /// sit outside it, or a click meant for export would also change the glove.
+        /// </summary>
+        private VisualElement DesignRow(string label, System.Action onWear, VisualElement right,
+                                        bool rightInsideButton)
+        {
+            var row = new VisualElement();
+            row.style.flexDirection = FlexDirection.Row;
+            row.style.alignItems = Align.Center;
+            row.style.width = Length.Percent(100f);
+            row.style.marginBottom = U(7f);
+            row.style.paddingLeft = U(8f);
+            row.style.paddingRight = U(6f);
+            row.style.paddingTop = U(5f);
+            row.style.paddingBottom = U(5f);
+            row.style.backgroundColor = new Color(1f, 0.94f, 0.78f, 0.05f);
+            SetBorderWidth(row, 1);
+            SetBorderColor(row, new Color(1f, 0.94f, 0.78f, 0.14f));
+
+            var wear = new Button(onWear) { text = string.Empty };
+            ResetThemeDefaults(wear);
+
+            // Not focusable, and this is the fix for a real bug rather than a detail.
+            //
+            // A ScrollView scrolls to bring a newly focused child into view. Every button in
+            // this list is a child of one, so clicking a row moved the list under the cursor
+            // mid-click: the row appeared to slide away and the click often landed on nothing.
+            // These are pointer targets, not keyboard stops, so taking them out of the focus
+            // ring removes the behaviour at its source.
+            wear.focusable = false;
+            wear.style.flexGrow = 1f;
+            wear.style.flexDirection = FlexDirection.Row;
+            wear.style.alignItems = Align.Center;
+            wear.style.backgroundColor = Color.clear;
+            wear.style.marginLeft = 0;
+            wear.style.marginRight = 0;
+            wear.style.paddingLeft = 0;
+            wear.style.paddingRight = 0;
+            wear.style.paddingTop = 0;
+            wear.style.paddingBottom = 0;
+            SetBorderWidth(wear, 0);
+
+            var cap = new Label(label);
+            cap.style.fontSize = S(BaseSection) * 1.12f;
+            cap.style.letterSpacing = U(1.3f);
+            cap.style.wordSpacing = U(4f);
+            cap.style.color = Parchment;
+            cap.style.unityFontStyleAndWeight = FontStyle.Bold;
+            cap.style.flexGrow = 1f;
+            cap.style.unityTextAlign = TextAnchor.MiddleLeft;
+            ApplyFont(cap, true);
+            wear.Add(cap);
+            if (right != null && rightInsideButton) wear.Add(right);
+
+            row.Add(wear);
+            if (right != null && !rightInsideButton) row.Add(right);
+            return row;
+        }
+
+        /// <summary>The picture on a fixed design's row. One shape for all of them.</summary>
+        private VisualElement ThumbBox(Texture2D thumb)
+        {
+            var art = new VisualElement();
+            float artW = U(presetWidth * 1.85f);
+            art.style.width = artW;
+            art.style.height = artW / 1.75f;
+            art.style.flexShrink = 0;
+            if (thumb != null)
+            {
+                art.style.backgroundImage = new StyleBackground(thumb);
+                Fit(art);
+            }
+            else art.style.backgroundColor = ChipBg;
+            SetBorderWidth(art, 1);
+            SetBorderColor(art, new Color(ChipBorder.r, ChipBorder.g, ChipBorder.b, 0.5f));
+            return art;
+        }
+
+        /// <summary>
+        /// What an additional design carries instead of a picture: export it, or drop it.
+        ///
+        /// It fills exactly the box a default design gives to its thumbnail, so every row in
+        /// the list stays the same height whichever kind it is.
+        ///
+        /// The two controls are weighted deliberately. EXPORT is the one anybody came here to
+        /// press, so it takes the width and the gold. Delete is a narrow X, because a control
+        /// that discards work should be reachable without being easy to hit by accident.
+        /// </summary>
+        private VisualElement RowControls(System.Action onExport, System.Action onDelete)
+        {
+            float artW = U(presetWidth * 1.85f);
+
+            var wrap = new VisualElement();
+            wrap.style.flexDirection = FlexDirection.Row;
+            wrap.style.alignItems = Align.Stretch;
+            wrap.style.width = artW;
+            wrap.style.height = artW / 1.75f;
+            wrap.style.flexShrink = 0;
+
+            var send = new Button(onExport) { text = Spaced("EXPORT") };
+            ResetThemeDefaults(send);
+            send.focusable = false;          // see DesignRow: focus makes the list scroll
+            send.style.flexGrow = 1f;
+            send.style.marginLeft = 0;
+            send.style.marginRight = U(3f);
+            send.style.fontSize = S(BaseHint);
+            send.style.letterSpacing = 1.4f;
+            send.style.color = Gold;
+            send.style.backgroundColor = new Color(Gold.r, Gold.g, Gold.b, 0.10f);
+            SetBorderWidth(send, 1);
+            SetBorderColor(send, new Color(Gold.r, Gold.g, Gold.b, 0.45f));
+            if (displayFont != null)
+                send.style.unityFontDefinition = FontDefinition.FromFont(displayFont);
+            wrap.Add(send);
+
+            var drop = new Button(onDelete) { text = "X" };
+            ResetThemeDefaults(drop);
+            drop.focusable = false;
+            drop.style.width = U(20f);
+            drop.style.flexShrink = 0;
+            drop.style.marginLeft = 0;
+            drop.style.marginRight = 0;
+            drop.style.fontSize = S(BaseHint);
+            drop.style.color = TextMuted;
+            drop.style.backgroundColor = ChipBg;
+            SetBorderWidth(drop, 1);
+            SetBorderColor(drop, new Color(1f, 0.94f, 0.78f, 0.16f));
+            if (displayFont != null)
+                drop.style.unityFontDefinition = FontDefinition.FromFont(displayFont);
+            wrap.Add(drop);
+
+            return wrap;
+        }
+
+        /// <summary>The variant id a design in the set is stored under, or an empty string.</summary>
+        private static string VariantIdOf(GloveVariantSet set, int preset)
+        {
+            foreach (var seg in set.segments)
+                if (preset >= 0 && preset < seg.VariantCount) return seg.VariantId(preset);
+            return string.Empty;
+        }
+
+        /// <summary>
+        /// Take a design out of the list.
+        ///
+        /// This one already exists in the project, put there by an engineer, so the tool
+        /// dismisses it rather than deleting it: the running tool has no path to a project
+        /// asset and should not acquire one. Deleting the files is the editor's job.
+        /// </summary>
+        private void DismissPreset(string variantId)
+        {
+            if (string.IsNullOrEmpty(variantId)) return;
+            HiddenDesigns.Hide(variantId);
+            Debug.Log($"[GloveCustomizerUI] Design '{variantId}' hidden from the list. Its "
+                    + "materials and prefab are still in the project -- remove those with "
+                    + "Recast Customizer > Remove Imported Design.");
+            BuildPanel();
+        }
+
+        /// <summary>Discard a design saved in this session.</summary>
+        private void DeleteSavedDesign(int index)
+        {
+            var design = DesignLibrary.At(index);
+            if (design == null) return;
+            DesignLibrary.RemoveAt(index);
+            // Indices shift when one is removed, and a stale index would light the wrong row.
+            _wornSaved = -1;
+            Debug.Log($"[GloveCustomizerUI] Deleted saved design '{design.name}'.");
+            RebuildSavedList();
+            RefreshAll();
+        }
+
+        /// <summary>
+        /// Export the look currently on screen, named after the design being pressed.
+        ///
+        /// A design already in the set has no stored snapshot to send -- its values live in
+        /// its materials, not in the tool -- so this exports what is on the glove now. Useful
+        /// for sending a variation on an imported design back for another pass.
+        /// </summary>
+        private void ExportCurrentAs(int preset)
+        {
+            if (_designNameField != null)
+                _designNameField.value = "DESIGN " + (preset + 1);
+            ExportLookFile();
+        }
+
+        /// <summary>
+        /// Make a scroll view look like it belongs to this panel.
+        ///
+        /// The default scroller is an operating-system grey control with arrow buttons at both
+        /// ends, which reads as a seam in a hand-drawn frame. The arrows go, the track sinks
+        /// into the plate, and the dragger becomes the same gold as everything else here that
+        /// responds to being moved.
+        /// </summary>
+        private void StyleScroller(ScrollView sv)
+        {
+            var s = sv.verticalScroller;
+            if (s == null) return;
+
+            s.style.width = U(10f);
+            if (s.lowButton != null) s.lowButton.style.display = DisplayStyle.None;
+            if (s.highButton != null) s.highButton.style.display = DisplayStyle.None;
+
+            var slider = s.slider;
+            if (slider == null) return;
+            slider.style.marginLeft = U(4f);
+            slider.style.marginRight = 0;
+            slider.style.width = U(6f);
+
+            var tracker = slider.Q("unity-tracker");
+            if (tracker != null)
+            {
+                tracker.style.backgroundColor = new Color(0f, 0f, 0f, 0.30f);
+                tracker.style.marginLeft = 0;
+                tracker.style.marginRight = 0;
+                SetBorderWidth(tracker, 0);
+            }
+
+            var dragger = slider.Q("unity-dragger");
+            if (dragger != null)
+            {
+                dragger.style.backgroundColor = new Color(Gold.r, Gold.g, Gold.b, 0.85f);
+                dragger.style.width = U(6f);
+                dragger.style.marginLeft = 0;
+                dragger.style.marginTop = 0;
+                SetBorderWidth(dragger, 0);
+                float r = U(3f);
+                dragger.style.borderTopLeftRadius = r;
+                dragger.style.borderTopRightRadius = r;
+                dragger.style.borderBottomLeftRadius = r;
+                dragger.style.borderBottomRightRadius = r;
+            }
+        }
+
+        /// <summary>
+        /// The save control, kept outside the scroll so it never scrolls out of reach.
+        /// </summary>
+        private void BuildSaveRow(VisualElement c, int authoredPresets)
+        {
+            var rule = new VisualElement();
+            rule.style.height = 1;
+            rule.style.marginTop = U(3f);
+            rule.style.marginBottom = U(7f);
+            rule.style.backgroundColor = new Color(Gold.r, Gold.g, Gold.b, 0.16f);
+            c.Add(rule);
+
+            var row = new VisualElement();
+            row.style.flexDirection = FlexDirection.Row;
+            row.style.alignItems = Align.Center;
+            row.style.width = Length.Percent(100f);
+            row.style.marginBottom = U(6f);
+
+            // A name, not a number. It travels in the file and comes out the other end in
+            // Unity as the material and prefab names, so it is worth typing something real.
+            _designNameField = new TextField { value = DesignLibrary.SuggestName(authoredPresets) };
+            _designNameField.style.flexGrow = 1f;
+            _designNameField.style.marginRight = U(5f);
+            _designNameField.style.marginLeft = 0;
+            _designNameField.style.fontSize = S(BaseSection);
+            var input = _designNameField.Q("unity-text-input");
+            if (input != null)
+            {
+                input.style.backgroundColor = ChipBg;
+                input.style.color = Parchment;
+                input.style.paddingLeft = U(5f);
+                input.style.paddingRight = U(5f);
+                SetBorderWidth(input, 1);
+                SetBorderColor(input, new Color(1f, 0.94f, 0.78f, 0.22f));
+            }
+
+            var save = LegendButton("SAVE DESIGN", SaveCurrentDesign);
+            save.style.marginLeft = 0f;      // the legend's gutter would push it off the panel
+
+            row.Add(_designNameField);
+            row.Add(save);
+            c.Add(row);
+        }
+
+        /// <summary>
+        /// Redraw the designs saved this session, one row each, numbered on from the fixed
+        /// designs so the list reads as one sequence.
+        /// </summary>
+        private void RebuildSavedList()
+        {
+            if (_savedList == null) return;
+            _savedList.Clear();
+            _savedTiles.Clear();
+
+            int authored = _presetTiles.Count;
+
+            for (int i = 0; i < DesignLibrary.Count; i++)
+            {
+                int index = i;
+                var design = DesignLibrary.At(index);
+                if (design == null) continue;
+
+                var label = string.IsNullOrWhiteSpace(design.name)
+                    ? "DESIGN " + (authored + i + 1)
+                    : design.name.ToUpperInvariant();
+
+                var savedRow = DesignRow(label, () => WearSavedDesign(index),
+                    RowControls(() => ExportSavedDesign(index),
+                                () => DeleteSavedDesign(index)), false);
+                _savedList.Add(savedRow);
+                _savedTiles.Add(savedRow);
+            }
+
+            UpdateListHeight();
+        }
+
+        /// <summary>One row's lit or unlit state. Both lists use it, so they cannot drift apart.</summary>
+        private void HighlightDesignRow(VisualElement row, bool on)
+        {
+            if (row == null) return;
+            row.style.color = on ? TextMain : TextMuted;
+            SetBorderWidth(row, on ? 2 : 1);
+            SetBorderColor(row, on ? Gold : new Color(1f, 0.94f, 0.78f, 0.14f));
+            row.style.opacity = on ? 1f : 0.58f;
+            row.style.translate = new Translate(0, on ? -3 : 0);
+        }
+
+        /// <summary>How many design rows the list is showing, fixed and saved together.</summary>
+        private int DesignRowCount()
+        {
+            int saved = _savedList != null ? _savedList.childCount : 0;
+            return _presetTiles.Count + saved;
+        }
+
+        /// <summary>
+        /// Size the list to whatever a row actually turned out to be, and show the scrollbar
+        /// only when there is genuinely more than fits.
+        ///
+        /// The height comes from the first laid-out row rather than from a formula. Layout
+        /// decides a row's height from its label's line box as much as from its thumbnail, and
+        /// the formula that tried to predict it was short by a quarter, which is why a list of
+        /// five designs scrolled when six were supposed to fit.
+        /// </summary>
+        private void UpdateListHeight()
+        {
+            if (_designList == null) return;
+
+            float row = 0f;
+            foreach (var child in _designList.contentContainer.Children())
+            {
+                if (child == _savedList) continue;
+                float h = child.resolvedStyle.height;
+                if (h <= 0f) continue;
+                row = h + child.resolvedStyle.marginBottom;
+                break;
+            }
+            if (row <= 0f) return;      // not laid out yet; the geometry callback will return
+
+            int rows = DesignRowCount();
+            bool overflows = rows > MaxVisibleDesigns;
+
+            // A whole number of rows, so a partial row never peeks over the edge and invites a
+            // scroll that is not there.
+            float target = row * MaxVisibleDesigns;
+            if (!Mathf.Approximately(_appliedListHeight, target))
+            {
+                _appliedListHeight = target;
+                _designList.style.maxHeight = target;
+            }
+
+            var wanted = overflows ? ScrollerVisibility.Auto : ScrollerVisibility.Hidden;
+            if (_designList.verticalScrollerVisibility != wanted)
+                _designList.verticalScrollerVisibility = wanted;
+        }
+
+
+        /// <summary>
+        /// Keep the current combination and its look values as a named design.
+        ///
+        /// Saving does not export. Browser storage reaches nobody else, so this only means
+        /// the design survives a page reload and can be worn again; handing it to an engineer
+        /// is still the export button's job. Keeping those two ideas separate stops a content
+        /// designer from believing a save has sent something.
+        /// </summary>
+        private void SaveCurrentDesign()
+        {
+            if (_tuner == null || assembly == null) return;
+
+            int authored = 0;
+            foreach (var seg in assembly.VariantSet.segments)
+                authored = Mathf.Max(authored, seg.VariantCount);
+
+            string name = _designNameField != null ? _designNameField.value : null;
+            if (string.IsNullOrWhiteSpace(name)) name = DesignLibrary.SuggestName(authored);
+
+            var design = _tuner.CaptureDesign(name);
+            if (!DesignLibrary.Add(design)) return;   // library full; it says so itself
+            RebuildSavedList();
+
+            if (_designNameField != null)
+                _designNameField.value = DesignLibrary.SuggestName(authored);
+
+            Debug.Log($"[GloveCustomizerUI] Saved design '{design.name}' -- {design.combination}, "
+                    + $"{design.TunedCount} part(s) tuned, {design.BakeCount} new map(s) on import. "
+                    + "Use EXPORT JSON to send it to Unity.");
+        }
+
+        /// <summary>
+        /// Write one saved design to a file, exactly as it was saved.
+        ///
+        /// This reads the stored snapshot rather than asking the tuner what it currently
+        /// holds, which is the whole point: a design is a decision somebody made at a moment,
+        /// and it should not quietly follow the sliders around afterwards.
+        /// </summary>
+        private void ExportSavedDesign(int index)
+        {
+            var design = DesignLibrary.At(index);
+            if (design == null || assembly == null) return;
+
+            var json = JsonUtility.ToJson(design, true);
+            var slug = new System.Text.StringBuilder();
+            foreach (var ch in (design.name ?? "").ToLowerInvariant())
+                if (char.IsLetterOrDigit(ch)) slug.Append(ch);
+            if (slug.Length == 0) slug.Append("design");
+
+            WriteJsonExport(json,
+                assembly.VariantSet.assetName + "_design_" + slug + ".json",
+                $"Saved design '{design.name}' -- {design.TunedCount} part(s) tuned, "
+                + $"{design.BakeCount} new map(s) on import.");
+        }
+
+        /// <summary>Puts a saved design back on the glove, parts and look values together.</summary>
+        private void WearSavedDesign(int index)
+        {
+            var design = DesignLibrary.At(index);
+            if (design == null || _tuner == null) return;
+
+            _wornSaved = index;
+            _applyingPreset = true;
+            _tuner.ApplyDesign(design);
+            _applyingPreset = false;
+
+            if (_designNameField != null) _designNameField.value = design.name;
+
+            foreach (var c in _callouts) { c.Pop = 1f; c.Reveal = 0f; }
+            if (Orbit != null) Orbit.Breathe();
+            foreach (var sway in assembly.GetComponentsInChildren<SecondaryMotion>(true))
+                sway.Nudge();
+
+            RefreshAll();
         }
 
 
@@ -1851,6 +2410,7 @@ namespace RecastCustomizer
         private void ApplyPreset(int preset)
         {
             var set = assembly.VariantSet;
+            _wornSaved = -1;                 // a fixed design is being worn now
             _applyingPreset = true;
             for (int s = 0; s < set.segments.Count; s++)
             {
@@ -1858,6 +2418,18 @@ namespace RecastCustomizer
                 if (count == 0) continue;
                 assembly.SetVariantAt(s, Mathf.Clamp(preset, 0, count - 1));
             }
+
+            // Clear the look adjustments on the parts this design just selected.
+            //
+            // Look values are held per part and per variant, so without this a design would
+            // come back wearing whatever was last tried on those same variants, and a
+            // "default" would slowly stop being one. A fixed design has to be a reliable
+            // reference point, or there is nothing to compare an experiment against.
+            //
+            // Anything worth keeping should have been saved as its own design first.
+            if (_tuner != null)
+                for (int s = 0; s < set.segments.Count; s++) _tuner.Reset(s);
+
             _applyingPreset = false;
 
             foreach (var c in _callouts) { c.Pop = 1f; c.Reveal = 0f; }
@@ -1880,7 +2452,22 @@ namespace RecastCustomizer
             int count = set.segments[segment].VariantCount;
             if (count == 0) return;
             int next = ((assembly.Selection[segment] + delta) % count + count) % count;
+
+            // Changing a part means the glove is no longer the saved design it started from.
+            _wornSaved = -1;
             assembly.SetVariantAt(segment, next);
+
+            // A part swap gives you the material as the artist authored it.
+            //
+            // Look values are held per part and per variant, so tuning a part while building a
+            // design left those values attached to that variant. Stepping back to it later
+            // returned the tuned look rather than the authored one: the thumbnail showed the
+            // artist's green bottom while the glove rendered the purple from a saved design.
+            //
+            // Tuning belongs to a design, not to a variant. Swapping a part is how you get
+            // back to a known starting point, and wearing a saved design is how you get its
+            // values back.
+            if (_tuner != null) _tuner.Reset(segment);
         }
 
         private int ActivePreset()
@@ -1983,15 +2570,16 @@ namespace RecastCustomizer
                 }
             }
 
-            int active = ActivePreset();
+            // A saved design wins over the fixed one its parts happen to match.
+            int active = _wornSaved >= 0 ? -1 : ActivePreset();
+
+            for (int i = 0; i < _savedTiles.Count; i++)
+                HighlightDesignRow(_savedTiles[i], i == _wornSaved);
+
             for (int i = 0; i < _presetTiles.Count; i++)
             {
                 bool on = i == active;
-                _presetTiles[i].style.color = on ? TextMain : TextMuted;
-                SetBorderWidth(_presetTiles[i], on ? 2 : 1);
-                SetBorderColor(_presetTiles[i], on ? Gold : new Color(1f, 0.94f, 0.78f, 0.14f));
-                _presetTiles[i].style.opacity = on ? 1f : 0.58f;
-                _presetTiles[i].style.translate = new Translate(0, on ? -3 : 0);
+                HighlightDesignRow(_presetTiles[i], on);
             }
 
             for (int a = 0; a < _stats.Count && a < set.attributes.Count; a++)
@@ -2073,28 +2661,44 @@ namespace RecastCustomizer
         {
             if (_tuner == null) return;
 
-            if (_tuner.TouchedCount() == 0)
-            {
-                Debug.Log("[GloveCustomizerUI] Nothing to export -- no material has been " +
-                          "adjusted yet. Drag a slider first.");
-                return;
-            }
+            // No "nothing to export" guard any more, and its absence is the point.
+            //
+            // This used to refuse unless a slider had moved, because the file described a
+            // reviewer's edits. It now describes a design, and a design made purely by
+            // swapping parts is a completely legitimate thing to hand to an engineer. The
+            // combination is the content.
+            // This exports what is on screen right now, under whatever name the field holds.
+            // To export a design as it was saved, use the EXPORT button on its own row --
+            // this one deliberately follows the sliders.
+            var designName = _designNameField != null ? _designNameField.value : null;
+            var json = _tuner.ToJson(designName);
 
-            var json = _tuner.ToJson();
+            WriteJsonExport(json,
+                assembly.VariantSet.assetName + "_current_"
+                + assembly.GetCombinationCode() + ".json",
+                "The look currently on screen. For a saved design, use the EXPORT button on "
+                + "its row instead.");
+        }
+
+        /// <summary>
+        /// One write path for both exports. A web build has no filesystem, so the bytes go to
+        /// the browser as a download; in the editor they land in the project so they can be
+        /// imported straight back without leaving Unity.
+        /// </summary>
+        private void WriteJsonExport(string json, string fileName, string note)
+        {
             var bytes = System.Text.Encoding.UTF8.GetBytes(json);
-            var fileName = assembly.VariantSet.assetName + "_look_"
-                         + assembly.GetCombinationCode() + ".json";
 
 #if UNITY_WEBGL && !UNITY_EDITOR
             RecastDownloadFile(fileName, bytes, bytes.Length);
-            Debug.Log("[GloveCustomizerUI] Look file sent to browser: " + fileName);
+            Debug.Log("[GloveCustomizerUI] Sent to browser: " + fileName + "  |  " + note);
 #else
             var dir = Path.Combine(Directory.GetCurrentDirectory(), screenshotFolder);
             Directory.CreateDirectory(dir);
             var file = Path.Combine(dir, fileName);
             File.WriteAllText(file, json);
-            Debug.Log("[GloveCustomizerUI] Look file saved: " + file
-                      + "  |  Apply it with Recast Customizer > Apply Look File.");
+            Debug.Log("[GloveCustomizerUI] Saved: " + file + "  |  " + note
+                      + "  |  Bring it in with Recast Customizer > Import Design From File.");
 #endif
         }
 
