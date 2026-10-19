@@ -1,0 +1,48 @@
+{
+  "profile": "mobile_gameplay",
+  "about": "Budget and convention limits the falcon glove kit is checked against, for a glove worn during play alongside characters and environment rather than shown alone on a customisation screen. A limit left null is not enforced: the validator still measures it and reports the number.",
+  "limits": {
+    "max_triangles_per_asset": 6000,
+    "max_triangles_per_segment": null,
+    "max_materials_per_design": 4,
+    "max_texture_memory_mb_per_design": 50,
+    "warn_texture_memory_mb_per_design": 40,
+    "max_texture_size": 2048,
+    "min_uv_coverage_percent": null,
+    "max_uv_overlap_texels": 0,
+    "require_power_of_two": true,
+    "require_square_textures": true,
+    "require_maps": ["diffuse", "normal"],
+    "require_8_bit_channels": true,
+    "forbid_orphan_textures": true,
+    "require_consistent_import_size": true
+  },
+  "segment_overrides": {
+    "about": "Per-part decisions. uv_overlap_allowed records an authored choice -- mirrored UVs are normal on some shapes -- so that an overlap anywhere it was not declared still fails. Texture size is not set per part: the ceiling is 2048 for every part, whatever its packing.",
+    "top": { "uv_overlap_allowed": false },
+    "bottom": { "uv_overlap_allowed": false },
+    "thumb": { "uv_overlap_allowed": false },
+    "tassel": { "uv_overlap_allowed": true }
+  },
+  "memory_assumptions": {
+    "about": "Texture memory cannot be read from a PNG, because what ships is the compressed form the engine builds at import. The assumption is stated here so every reported figure can be traced to it.",
+    "format": "ASTC 6x6",
+    "bits_per_pixel": 3.56,
+    "mipmaps": true,
+    "mipmap_multiplier": 1.3333
+  },
+  "notes_on_maps": "A specular map is optional by design. These materials use URP's specular workflow, and the non-metallic parts -- the leather -- use a flat specular colour rather than a map, because a map there shifts saturation for no gain. So an absent specular map is a decision, not a defect. What is checked instead is the opposite case: a texture sitting in the project that no material references.",
+  "sources": {
+    "about": "Where each limit came from. Every entry names a public reference or a measurement of this asset -- never an employer's internal figures.",
+    "max_triangles_per_asset": "Meta's mobile guidance puts a conservative whole-scene budget near 50,000 triangles per view. A worn prop sharing that scene with a character and environment is allotted roughly an eighth of it.",
+    "max_triangles_per_segment": "Deliberately unset. A triangle budget applies to an asset, a draw call or a scene; there is no production convention for a per-submesh limit, so the per-part count is measured and reported but not judged.",
+    "max_materials_per_design": "Structural, not a budget: one material per segment, and the asset has four segments.",
+    "max_texture_memory_mb_per_design": "A ceiling rather than a target. Every texture is built at 2048 -- a deliberate choice to keep the asset at full quality in the viewer rather than a budget-driven one -- which puts each authored design at 33.23 MB. The limit is set at 50 to leave room for an imported design that carries maps the authored ones do not, such as a specular or occlusion map on a part that was painted without one. It is deliberately not set just above today's figure: a limit that only the current asset can pass is a description of the present rather than a budget. On a real mobile title this number would be the first thing cut.",
+    "warn_texture_memory_mb_per_design": "Not a limit: a design above this is reported and still passes. The ceiling at 50 leaves deliberate room for maps the authored designs do not carry, which also means a design could drift well past today's 33.23 MB without anything saying so. This says so, without failing work that is within budget.",
+    "max_texture_size": "Unity's mobile documentation requires power-of-two dimensions for the mobile compression formats. 2048 is the ceiling, and it applies to every part equally. The limit is checked against the size the importer will build, not the size of the source file.",
+    "min_uv_coverage_percent": "Deliberately unset. Packing efficiency is reported as a figure, not judged: a part is free to use as little of its map as the art requires, so long as the map itself stays within the size ceiling.",
+    "max_uv_overlap_texels": "Overlapping faces share pixels, so painting one changes the other. Zero by default, with mirroring declared per part where it is intended.",
+    "require_consistent_import_size": "Unity’s Max Size, not the file on disk, decides what a texture costs in a build. Mixed settings across one asset mean some parts carry more detail than others for no stated reason, which reads as an oversight rather than a decision.",
+    "forbid_orphan_textures": "Unity excludes unreferenced assets from a build, so an orphan costs nothing at runtime. It is flagged as project hygiene: it carries import time and repository weight, and it leaves the intent ambiguous -- nobody can tell a map that was deliberately unhooked from one that was forgotten."
+  }
+}

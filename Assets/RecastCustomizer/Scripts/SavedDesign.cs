@@ -150,6 +150,19 @@ namespace RecastCustomizer
             Flush();
         }
 
+        /// <summary>
+        /// Stop hiding one design.
+        ///
+        /// Needed when a design is deleted outright rather than dismissed: leaving its id on
+        /// this list means a later design that reuses the number is invisible for no reason
+        /// anybody can see.
+        /// </summary>
+        public static void Show(string id)
+        {
+            if (string.IsNullOrEmpty(id) || !All.Remove(id)) return;
+            Flush();
+        }
+
         public static void ShowAll()
         {
             All.Clear();

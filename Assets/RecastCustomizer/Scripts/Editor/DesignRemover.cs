@@ -144,6 +144,19 @@ namespace RecastCustomizer.EditorTools
             return found;
         }
 
+        /// <summary>
+        /// Removes one imported design by id, for callers outside this menu.
+        ///
+        /// The running tool's dismiss button uses this in the editor. In a player build
+        /// there are no project files to delete, so the tool hides the design instead --
+        /// which is the honest behaviour there rather than a lesser one.
+        /// </summary>
+        public static void RemoveImported(GloveVariantSet set, string id)
+        {
+            if (set == null || string.IsNullOrEmpty(id)) return;
+            RemoveDesign(set, id);
+        }
+
         private static void RemoveDesign(GloveVariantSet set, string id)
         {
             var folder = FolderFor(id);

@@ -37,9 +37,10 @@ without an artist, keep what is worth shipping, and have the engine reproduce it
 
 ## What is in this repository
 
-Source only: the C# that drives the tool, the shaders written for it, and the browser
-plugin that carries a file out of the WebGL sandbox. The asset, the scene and the
-materials are not here — see [What is not here](#what-is-not-here).
+Source only: the C# that drives the tool, the shaders written for it, the Python and
+headless-Blender pipeline that checks the asset, and the browser plugin that carries a
+file out of the WebGL sandbox. The asset, the scene and the materials are not here — see
+[What is not here](#what-is-not-here).
 
 ### Runtime
 
@@ -84,6 +85,47 @@ separates a tool from a demo.
 `RecastDownload.jslib` — a WebGL build has no filesystem, so the usual write call silently
 does nothing. This copies the bytes out of the engine heap into a blob and clicks a
 temporary link, which produces an ordinary download.
+
+---
+
+### The asset pipeline
+
+`pipeline/` — Python and headless Blender, outside `Assets/` so Unity ignores it.
+
+One command measures the kit and checks it against a rules file, writing an HTML report,
+a JSON report, and a non-zero exit code when anything fails:
+
+    python pipeline/check.py
+
+Every limit records where it came from, in the rules file itself. A limit left `null` is
+measured and reported but not judged, which is how a limit gets chosen rather than
+guessed. Ten generated fixtures prove each check fires for the right reason, and a
+deliberately faulty copy of the real glove is derived by script rather than hand-made.
+
+The same checks run in three places, which is the point of it:
+
+| | |
+|---|---|
+| A terminal | unattended, with an exit code |
+| The Unity editor | on a design, as it is imported |
+| **The running tool** | in the browser, on the asset in the viewport |
+
+That last one measures triangles, materials, texture sizes and memory, empty map slots,
+UVs off the sheet or overlapping, a colour map that is really a normal map, and a mesh
+whose triangle count no longer matches what was recorded. Anything that fails is **ringed
+on the glove**, and a fault with a place — faces missing from a part — is ringed at that
+place rather than around the whole part, by finding the boundary loop the missing faces
+left.
+
+The editor and browser checks are C# reading the AssetDatabase; the offline ones are
+Python reading files. Both take their limits from one generated file, so they cannot
+describe different rules. Measured against the authored kit they arrive at 33.23 MB
+independently.
+
+`pipeline/comfyui/` holds two custom ComfyUI nodes for restyling one part's texture in
+place, with a composite step that proves on every run that nothing outside the target
+region changed. The art it produced was not good enough to ship, which is written up
+rather than hidden.
 
 ---
 
@@ -172,10 +214,13 @@ private static bool IsViewportCamera(Camera cam)
 | Swappable parts | 4 |
 | Designs per part | 3 |
 | Live material parameters | 5 |
-| Scripts | 22 |
+| Scripts | 31 |
 | Shaders written | 3 |
-| Editor menu tools | 16 |
-| Build size | 23 MB |
+| Editor menu tools | 20 |
+| Checks on the asset | 77 passing |
+| Triangles | 5,003 against a budget of 6,000 |
+| Texture memory per design | 33.23 MB |
+| Build size | 36 MB |
 | Team | 1 |
 
 ---
@@ -187,7 +232,8 @@ project will not produce the tool, and that is deliberate — the code is the in
 part, and a 300 MB clone is not.
 
 Not included: the glove mesh and its textures, the materials, the scene, the prefabs, the
-variant set asset, and the `.meta` files Unity generates. If you want the running tool,
+variant set asset, the generated reports and UV masks, and the `.meta` files Unity
+generates. If you want the running tool,
 use the [WebGL build](https://play.unity.com/api/v1/games/game/f5c98ea7-d099-4096-888b-c55dacaadd11/build/latest/frame).
 
 If you want to run something like it against your own asset: the tool is asset-agnostic by

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using UnityEditor;
 using UnityEngine;
@@ -53,18 +54,81 @@ namespace RecastCustomizer.EditorTools
             var path = EditorUtility.OpenFilePanel(
                 "Choose a design file exported from the customizer", "", "json");
             if (string.IsNullOrEmpty(path)) return;
-            ImportFile(path);
+            var result = ImportFile(path);
+            DesignImportWindow.ShowResults(new[] { result });
+        }
+
+        /// <summary>
+        /// Recast Customizer ▸ Import Designs From Folder
+        ///
+        /// The same import, over every design file in a folder, with one summary at the end.
+        /// This is the difference between a convenience and a pipeline: a content team
+        /// exports twenty designs, and the useful answer is a table saying which nineteen
+        /// are fine, not twenty separate confirmations.
+        ///
+        /// Each design is confirmed once, up front, by the count -- not one dialog per file.
+        /// A design that cannot be read does not stop the others; it is reported alongside
+        /// them.
+        /// </summary>
+        [MenuItem("Recast Customizer/Import Designs From Folder")]
+        public static void ImportFolder()
+        {
+            var folder = EditorUtility.OpenFolderPanel(
+                "Choose a folder of design files exported from the customizer", "", "");
+            if (string.IsNullOrEmpty(folder)) return;
+
+            var files = Directory.GetFiles(folder, "*.json", SearchOption.TopDirectoryOnly);
+            Array.Sort(files, StringComparer.OrdinalIgnoreCase);
+
+            if (files.Length == 0)
+            {
+                EditorUtility.DisplayDialog("Nothing to import",
+                    "No .json files in that folder.", "OK");
+                return;
+            }
+
+            if (!EditorUtility.DisplayDialog("Import " + files.Length + " design(s)?",
+                    "Every .json in\n" + folder + "\n\nwill be imported, numbered in turn and "
+                  + "checked against the asset's budget.\n\nNothing in GloveAsset is touched.",
+                    "Import all", "Cancel"))
+                return;
+
+            var results = new List<DesignImportWindow.Result>();
+            try
+            {
+                for (int i = 0; i < files.Length; i++)
+                {
+                    EditorUtility.DisplayProgressBar("Importing designs",
+                        Path.GetFileName(files[i]), (i + 1) / (float)files.Length);
+                    results.Add(ImportFile(files[i], interactive: false));
+                }
+            }
+            finally
+            {
+                EditorUtility.ClearProgressBar();
+            }
+
+            DesignImportWindow.ShowResults(results);
         }
 
         /// <summary>The menu item without the modal picker, so it can be scripted or tested.</summary>
-        public static void ImportFile(string path)
+        /// <param name="interactive">
+        /// False during a batch: the run was already confirmed as a whole, so a dialog per
+        /// file would turn one decision into twenty.
+        /// </param>
+        public static DesignImportWindow.Result ImportFile(string path, bool interactive = true)
         {
+            var outcome = new DesignImportWindow.Result
+            {
+                design = Path.GetFileNameWithoutExtension(path)
+            };
             var assembly = UnityEngine.Object.FindFirstObjectByType<ModularGloveAssembly>();
             if (assembly == null || assembly.VariantSet == null)
             {
-                Debug.LogError("[Design] No ModularGloveAssembly with a variant set in the open "
-                             + "scene. Open glove_studio and try again.");
-                return;
+                outcome.error = "No ModularGloveAssembly with a variant set in the open "
+                              + "scene. Open glove_studio and try again.";
+                Debug.LogError("[Design] " + outcome.error);
+                return outcome;
             }
 
             SavedDesign design;
@@ -74,25 +138,33 @@ namespace RecastCustomizer.EditorTools
             }
             catch (Exception e)
             {
-                Debug.LogError("[Design] Could not read that file: " + e.Message);
-                return;
+                outcome.error = "Could not read that file: " + e.Message;
+                Debug.LogError("[Design] " + outcome.error);
+                return outcome;
             }
 
             if (design == null || design.parts == null || design.parts.Count == 0)
             {
-                Debug.LogError("[Design] That file describes no parts, so there is no design "
-                             + "in it to import.");
-                return;
+                outcome.error = "That file describes no parts, so there is no design in it "
+                              + "to import.";
+                Debug.LogError("[Design] " + outcome.error);
+                return outcome;
             }
 
             var set = assembly.VariantSet;
 
             if (!string.IsNullOrEmpty(design.asset) && design.asset != set.assetName)
             {
-                if (!EditorUtility.DisplayDialog("Different asset",
+                if (interactive && !EditorUtility.DisplayDialog("Different asset",
                         $"That design was exported for '{design.asset}', but this scene has "
                       + $"'{set.assetName}'.\n\nImport it anyway?", "Import", "Cancel"))
-                    return;
+                {
+                    outcome.error = $"Cancelled: exported for '{design.asset}'.";
+                    return outcome;
+                }
+                if (!interactive)
+                    Debug.LogWarning($"[Design] '{design.name}' was exported for "
+                                   + $"'{design.asset}', not '{set.assetName}'. Imported anyway.");
             }
 
             string name = string.IsNullOrWhiteSpace(design.name)
@@ -105,10 +177,10 @@ namespace RecastCustomizer.EditorTools
 
             if (VariantIdExists(set, nn))
             {
-                Debug.LogError($"[Design] This set already has a variant numbered '{nn}'. "
-                             + "Remove that design first, or rename this one so it takes a "
-                             + "different number.");
-                return;
+                outcome.error = $"The set already has a variant numbered '{nn}'. Remove that "
+                              + "design first, or rename this one so it takes a different number.";
+                Debug.LogError("[Design] " + outcome.error);
+                return outcome;
             }
 
             // ------------------------------------------------------------------ plan first
@@ -149,17 +221,34 @@ namespace RecastCustomizer.EditorTools
                         : "  ->  reuses the authored material"));
             }
 
-            if (!EditorUtility.DisplayDialog($"Import '{name}' as design {nn}?",
+            // What it will cost, before a byte is written. A design is mostly references,
+            // so the figure that matters is what the finished design occupies in total --
+            // and someone deciding whether to import can only decide if they are told.
+            // A spec that has never been exported leaves every limit unset, and an unset
+            // limit is reported rather than judged -- the same rule the offline validator
+            // follows. Importing still works and still measures; it just cannot fail you
+            // against a budget nobody has written down yet.
+            var spec = RuntimeValidator.Spec.Load() ?? new RuntimeValidator.Spec();
+            float estimateMb = DesignValidator.EstimateMegabytes(
+                plan.Select(p => p.sourceMaterial), spec);
+            string budget = spec.maxTextureMemoryMb > 0
+                ? $"\n\nAbout {estimateMb:0.0} MB of texture memory, against a limit of "
+                  + $"{spec.maxTextureMemoryMb:0.##} MB. Checked properly once written."
+                : "";
+
+            if (interactive && !EditorUtility.DisplayDialog($"Import '{name}' as design {nn}?",
                     $"{plan.Count} part(s):\n\n{lines}\n"
                   + $"Writes {newMaterials} material(s), {newMaps} texture(s) and 1 prefab into\n"
                   + $"{folder}\n\n"
                   + "Named on the design number, so falcon_glove_bottom_02_mat becomes\n"
                   + $"falcon_glove_bottom_{nn}_mat.\n\n"
-                  + "Nothing in GloveAsset is touched.",
+                  + "Nothing in GloveAsset is touched."
+                  + budget,
                     "Import design", "Cancel"))
             {
                 Debug.Log("[Design] Cancelled. Nothing was written.");
-                return;
+                outcome.error = "Cancelled before anything was written.";
+                return outcome;
             }
 
             // ------------------------------------------------------------------ execute
@@ -199,16 +288,35 @@ namespace RecastCustomizer.EditorTools
             AssetDatabase.SaveAssets();
             AssetDatabase.Refresh();
 
+            // ------------------------------------------------------------------ check it
+            //
+            // The design is now real assets, so it can be measured rather than predicted.
+            // Catching a design that busts the budget here -- as it enters the project,
+            // named, attributable -- is the whole reason this step exists. Found in a build
+            // three weeks later it belongs to nobody.
+            outcome.design = $"{name} (design {nn})";
+            outcome.folder = folder;
+            outcome.rows = DesignValidator.Check(outcome.design, folder,
+                plan.Select(p => materialsForPrefab[p.segment.id]).ToList(), spec);
+
+            DesignValidator.WriteReport(folder, outcome.design, outcome.rows);
+
             var report = new StringBuilder();
             report.AppendLine($"[Design] Imported '{name}' as design {nn}.");
             foreach (var w in written) report.AppendLine("  created: " + w);
             report.AppendLine($"  Everything above is under {folder}. GloveAsset was not touched.");
             report.AppendLine($"  The set now expresses {set.CombinationCount} combinations.");
+            report.AppendLine(outcome.Failures == 0
+                ? "  Passed every budget check."
+                : $"  {outcome.Failures} budget check(s) failed -- see the import window.");
             report.AppendLine("  Run 'Bake Variant Thumbnails' so the new design gets a preview.");
             Debug.Log(report.ToString());
 
-            Selection.activeObject = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(folder);
+            if (interactive)
+                Selection.activeObject = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(folder);
+            return outcome;
         }
+
 
         private class PartPlan
         {
