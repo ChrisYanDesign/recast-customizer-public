@@ -55,6 +55,8 @@ file out of the WebGL sandbox. The asset, the scene and the materials are not he
 | `OrbitCamera.cs` | Framing, asymmetric orbit limits, zoom and pan. |
 | `CustomizerTour.cs` | The six-step first-run guide. |
 | `SecondaryMotion.cs` | Tassel sway, rotating about the mesh-bounds top so the attachment point never moves. |
+| `RuntimeValidator.cs` | The checks, run in the build on the asset in the viewport: triangles, materials, texture sizes and memory, empty map slots, UVs off the sheet or overlapping, a colour map that is really a normal map, and a mesh whose triangle count no longer matches the record. A coroutine, so the progress bar follows real work. |
+| `ValidationReport.cs` | The recorded report, for the three checks a browser cannot make: file naming, unused textures, import settings. |
 | `CustomizerChrome.cs`, `GloveCustomizerOverlay.cs` | Supporting interface pieces. |
 
 ### Shaders
@@ -67,7 +69,7 @@ file out of the WebGL sandbox. The asset, the scene and the materials are not he
 
 ### Editor tooling
 
-Sixteen menu items. This is the half of the work nobody sees, and the part that
+Twenty-one menu items. This is the half of the work nobody sees, and the part that
 separates a tool from a demo.
 
 | File | What it does |
@@ -78,6 +80,13 @@ separates a tool from a demo.
 | `ThumbnailBaker.cs` | Bakes the variant thumbnails so a design is chosen by image, not by filename. |
 | `WebBuildSetup.cs` | One-click WebGL build with the platform settings already applied. |
 | `StudioSceneBuilder.cs` | Applies the studio lighting rig documented in [`docs/LIGHTING_SETUP.md`](docs/LIGHTING_SETUP.md). |
+| `DesignValidator.cs` | The budget checks on a design, reading the AssetDatabase and the texture importers rather than shelling out to the pipeline, so they run on every import without needing Python or Blender. |
+| `DesignImportWindow.cs` | The result, for one design or twenty: failures first, passes collapsed behind a count. |
+| `DesignChecker.cs` | Re-measures designs already in the project, because a design checked once is not a design still correct. |
+| `ValidationWindow.cs` | Runs the offline pipeline from the editor and shows its output, so nobody has to open a terminal. |
+| `ValidationReportExporter.cs` | Carries the report and the limits into `Resources`, which is how the running build knows the rules. |
+| `BrokenShowcaseBuilder.cs` | Turns the deliberately faulty kit into a viewable asset, for demonstrating the checks against something that fails. |
+| `DesignRemoverBridge.cs` | Hands the running tool a way to delete a design. Runtime code cannot call the editor -- the editor assembly is built second -- so the dependency runs the other way. |
 | `GloveAssemblyBuilder.cs`, `CustomizerUIBuilder.cs`, `AttributeSeeder.cs`, `AmbientMotesBuilder.cs`, `BackdropTool.cs` | Scene and data scaffolding. |
 
 ### Browser plugin
@@ -215,8 +224,9 @@ private static bool IsViewportCamera(Camera cam)
 | Designs per part | 3 |
 | Live material parameters | 5 |
 | Scripts | 31 |
+| Python modules | 23 |
 | Shaders written | 3 |
-| Editor menu tools | 20 |
+| Editor menu tools | 21 |
 | Checks on the asset | 77 passing |
 | Triangles | 5,003 against a budget of 6,000 |
 | Texture memory per design | 33.23 MB |
